@@ -1,0 +1,333 @@
+---
+title: "STATS-418 HW-3"
+author: "Siyuan Li, 904884144"
+date: "5/24/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(warn = -1)
+
+### set working directory
+setwd("~/Dropbox/UCLA/STAT418 - Tools in Data Science/hm3")
+
+### loading dependencies
+suppressMessages(library(readr))
+suppressMessages(library(glmnet))
+suppressMessages(library(randomForest))
+suppressMessages(library(gbm))
+suppressMessages(library(ROCR))
+suppressMessages(library(h2o))
+```
+
+The dataset I will be delving into is the "Adult" dataset from UCI Machine Learning Repository. This dataset contains features that are associated with predicting whether annual income will exceed 50k US Dollars.
+
+```{r}
+### read in data
+suppressMessages(data1 <- read_csv("adult.csv", col_names = FALSE))
+suppressMessages(data2 <- read_csv("adult.test.csv", col_names = FALSE, na = "?"))
+adult <- rbind(data1, data2); rm(data1, data2) # bind data and remove redundent data from memory
+adult$X3 <- NULL; adult$X5 <- NULL # remove redundant column
+names(adult) <- c("age", "workclass", "education", "marital", "occupation", "relationship", "race", "sex", "capgain", "caploss", "hpw", "ethnicity", "income")
+```
+
+```{r}
+### check and clean for missing values
+sapply(adult, function(x) sum(is.na(x)))
+adult <- adult[complete.cases(adult),]
+sapply(adult, function(x) sum(is.na(x))) # check again
+```
+
+```{r}
+### convert response variable from factor to binary
+adult$income[which(adult$income == ">50K")] = 1 
+adult$income[which(adult$income == "<=50K")] = 0
+adult$income[which(adult$income == ">50K.")] = 1 
+adult$income[which(adult$income == "<=50K.")] = 0 
+adult$income <- as.numeric(adult$income)
+table(adult$income)
+```
+
+After data loading, cleaning missing rows, converting the response variable, the data shows 34014 negative cases, and 11208 positive cases.
+
+```{r}
+### convert categorical variable to factors
+adult[,c(2:8,12)] <- lapply(adult[,c(2:8,12)], factor)
+summary(adult)
+```
+
+The data contains 12 predictor variables and 1 response variable.
+
+```{r}
+### building train and test set
+set.seed(1)
+ntrain <- floor(0.5*nrow(adult)); ntrain
+nvalid <- floor(0.25*nrow(adult)); nvalid
+itrain <- sample(seq_len(nrow(adult)), ntrain, replace = FALSE)
+train <- adult[itrain,]
+Ntrain <- adult[-itrain,]
+ivalid <- sample(seq_len(nrow(Ntrain)), nvalid, replace = FALSE)
+valid <- Ntrain[ivalid,]
+test <- Ntrain[-ivalid,]
+rm(itrain, ivalid, ntrain, nvalid, Ntrain) # remove useless information from memory
+```
+
+Train set contains 22611 entries, validation set and test set each has 11305 entries.
+
+This section of code transforms the train, validation and test set into sparse matrix, essentially preparing them for computing a logistic regression model using `glmnet`.
+
+```{r}
+### make sparse matrix for logistic regression
+# train set
+train_factors <- model.matrix(
+  train$income ~ 
+    train$workclass +
+    train$education +
+    train$marital +
+    train$occupation +
+    train$relationship +
+    train$race +
+    train$sex +
+    train$ethnicity)[, -1]
+train_sparse <- as.matrix(data.frame(train$age, train$capgain, train$caploss, train$hpw, train_factors))
+rm(train_factors) # remove factor matrix from memory
+
+# validation set
+valid_factors <- model.matrix(
+  valid$income ~ 
+    valid$workclass +
+    valid$education +
+    valid$marital +
+    valid$occupation +
+    valid$relationship +
+    valid$race +
+    valid$sex +
+    valid$ethnicity)[, -1]
+valid_sparse <- as.matrix(data.frame(valid$age, valid$capgain, valid$caploss, valid$hpw, valid_factors))
+rm(valid_factors) # remove factor matrix from memory
+
+# test set
+test_factors <- model.matrix(
+  test$income ~ 
+    test$workclass +
+    test$education +
+    test$marital +
+    test$occupation +
+    test$relationship +
+    test$race +
+    test$sex +
+    test$ethnicity)[, -1]
+test_sparse <- as.matrix(data.frame(test$age, test$capgain, test$caploss, test$hpw, test_factors))
+rm(test_factors) # remove factor matrix from memory
+```
+
+#### Calculating model using R packages:
+
+##### Proceed with logistic regression:
+
+```{r}
+### logistics regression
+system.time(logistic <- glmnet(train_sparse, as.factor(train$income), alpha=1, family="binomial"))
+```
+
+```{r}
+roc_logit <- prediction(predict(logistic, valid_sparse)[,"s80"], valid$income)
+plot(performance(roc_logit, "tpr", "fpr"), colorize = TRUE)
+abline(0,1)
+```
+
+The ROC curve shows that the logistic model is a really good fit. Model Selection aims to reduce the false positive rate while imrpoving upon true positive rate, increasing the area under the curve.
+
+```{r}
+performance(roc_logit, "auc")@y.values[[1]]
+```
+
+AUC of the untuned logistic regression model using validation set is around 0.9022.
+
+Utilizing validation set, bootstrap with lambda value from 0 to 1 to calculate auc with each lambda. Eventually, the range is narrowed down to 0 to 0.2.
+
+```{r}
+lam <- seq(0, 0.19, 0.01)
+vauc <- c()
+for(i in 1:length(lam)){
+  logit <- glmnet(train_sparse, as.factor(train$income), lambda = lam[i], alpha=1, family="binomial")
+  roc_logit <- prediction(ifelse(predict(logit, valid_sparse, type = "response") > 0.5, 1, 0), valid$income)
+  vauc[i] <- performance(roc_logit, "auc")@y.values[[1]]
+}
+plot(lam, vauc, 
+  xlab = "Lambda", 
+  ylab = "AUC", 
+  main = "AUC vs. various lambda values")
+```
+
+Plot shows that `lambda = 0` is the best for the model.
+
+##### Proceed with random forest.
+
+```{r}
+### random forest
+system.time(suppressMessages(rf <- randomForest(income ~., data = train, type = "classification", ntree = 100)))
+```
+
+```{r}
+roc_rf <- prediction(predict(rf, valid), valid$income)
+plot(performance(roc_rf, "tpr", "fpr"), colorize = TRUE)
+abline(0,1)
+```
+
+```{r}
+performance(roc_rf, "auc")@y.values[[1]]
+```
+
+AUC of the untuned random forest model using validation set is around 0.9095.
+
+```{r}
+tauc <- c()
+vauc <- c()
+ntree <- c(10, 20, 30, 40, 50, 100)
+for(i in 1:length(ntree)){
+  suppressMessages(bootstraprf <- randomForest(income ~., data = train, ntree = ntree[i]))
+  troc_brf <- prediction(ifelse(predict(bootstraprf, train) > 0.5, 1, 0), train$income)
+  vroc_brf <- prediction(ifelse(predict(bootstraprf, valid) > 0.5, 1, 0), valid$income)
+  tauc[i] <- performance(troc_brf, "auc")@y.values[[1]]
+  vauc[i] <- performance(vroc_brf, "auc")@y.values[[1]]
+}
+plot(ntree, vauc, type = "l", 
+  xlab = "Number of Trees", 
+  ylab = "AUC", 
+  main = "AUC vs. various number of trees",
+  ylim = c(0.7, 1)); lines(ntree, tauc, type = "l", col = "red")
+```
+
+Exploring with different number of trees is significantly time consuming, the plot above shows that while training AUC stays relatively higher at around 0.9, validation set starts off around 0.75 and slowly flats out around 40 trees. Generally speaking, the more trees, the better the fit, but it is also more prune to overfitting.
+
+##### Proceed with generalized boosted model:
+
+```{r}
+### generalized boosted model
+system.time(boost <- gbm(income ~., data = train, 
+  distribution = "bernoulli", 
+  n.trees = 100, 
+  interaction.depth = 5, 
+  shrinkage = 0.01))
+```
+
+```{r}
+roc_gbm <- prediction(ifelse(predict(boost, valid, n.trees = 100) > 0.5, 1, 0), valid$income)
+plot(performance(roc_gbm, "tpr", "fpr"), colorize = TRUE)
+abline(0,1)
+```
+
+```{r}
+performance(roc_gbm, "auc")@y.values[[1]]
+```
+
+AUC of the untuned generalized boosted model using validation set is around 0.5907.
+
+Try speeding up the learning rate.
+
+```{r}
+### generalized boosted model
+system.time(boost <- gbm(income ~., data = train, 
+  distribution = "bernoulli", 
+  n.trees = 100, 
+  interaction.depth = 5, 
+  shrinkage = 0.05))
+```
+
+```{r}
+roc_gbm <- prediction(ifelse(predict(boost, valid, n.trees = 100) > 0.5, 1, 0), valid$income)
+plot(performance(roc_gbm, "tpr", "fpr"), colorize = TRUE)
+abline(0,1)
+```
+
+We see obvious improvement in true positive rate.
+
+```{r}
+performance(roc_gbm, "auc")@y.values[[1]]
+```
+
+By means of AUC, speeding up the learning rate improves the goodness of fit on the validation set.
+
+Try increasing the depth of tree.
+
+```{r}
+### generalized boosted model
+system.time(boost <- gbm(income ~., data = train, 
+  distribution = "bernoulli", 
+  n.trees = 100, 
+  interaction.depth = 10, 
+  shrinkage = 0.05))
+```
+
+```{r}
+roc_gbm <- prediction(ifelse(predict(boost, valid, n.trees = 100) > 0.5, 1, 0), valid$income)
+plot(performance(roc_gbm, "tpr", "fpr"), colorize = TRUE)
+abline(0,1)
+```
+
+We see no obvious improvement in true positive rate.
+
+```{r}
+performance(roc_gbm, "auc")@y.values[[1]]
+```
+
+By means of AUC, increasing the depth of trees improves the goodness of fit on the validation set, but not significantly.
+
+#### Trying the same models on h2o.ai framework:
+
+```{r}
+### load h2o and split train and test
+h2o.init(nthreads = -1)
+dt <- as.h2o(adult)
+dt[,13] <- as.factor(dt[,13])
+dt_split <- h2o.splitFrame(dt, ratios = 0.75, seed = 1)
+dt_train <- dt_split[[1]]
+dt_test <- dt_split[[2]]
+predictors <- names(dt_train)[which(names(dt_train) != "income")]
+```
+
+```{r}
+### logistic regression
+system.time({
+  logit2o <- h2o.glm(x = predictors, y = "income", training_frame = dt_train, family = "binomial", alpha = 1, lambda = 0)
+  })
+h2o.auc(h2o.performance(logit2o, dt_test))
+```
+
+AUC of the untuned logistic regression model using test set is around 0.9047.
+
+```{r}
+### random forest
+system.time({
+  rf2o <- h2o.randomForest(x = predictors, y = "income", training_frame = dt_train, ntrees = 100)
+  })
+h2o.auc(h2o.performance(rf2o, dt_test))
+```
+
+AUC of the untuned random forest model using test set is around 0.9179.
+
+```{r}
+### generalized boosted model
+system.time({
+  gbm2o <- h2o.gbm(x = predictors, y = "income", training_frame = dt_train, distribution = "bernoulli", ntrees = 100, max_depth = 10, seed = 1)
+  })
+h2o.auc(h2o.performance(gbm2o, dt_test))
+```
+
+AUC of the untuned generalized boosted model using test set is around 0.9237.
+
+Try early stopping on the generalized boosted model.
+
+```{r}
+system.time({
+  gbm2oes <- h2o.gbm(x = predictors, y = "income", training_frame = dt_train, distribution = "bernoulli", max_depth = 10, seed = 1, stopping_rounds = 100, stopping_metric = "AUC")
+  })
+gbm2oes
+h2o.auc(h2o.performance(gbm2oes, dt_test))
+```
+
+Early stopping shows that 50 trees is optimal with AUC of 0.9247.
+
+All the models computed under h2o framework shows very high AUC, suggesting good fit to the data. It should also be noted that h2o framework is significantly more efficient in computing these models, at least for random forest model.
